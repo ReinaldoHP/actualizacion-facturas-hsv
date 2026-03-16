@@ -14,87 +14,107 @@ class ActualizadorFacturas:
         """
         carpeta = Path(ruta_carpeta)
         if not carpeta.exists() or not carpeta.is_dir():
-            return {"exito": False, "mensaje": f"La carpeta {ruta_carpeta} no existe o no es un directorio válida."}
+            return {"exito": False, "mensaje": f"La carpeta {ruta_carpeta} no existe o no es un directorio válido."}
         
-        # 1. Encontrar todos los archivos FEV
+        # 1. Encontrar archivos FEV
         archivos_fev = list(carpeta.glob("FEV_*.pdf"))
         
         if len(archivos_fev) < 2:
-            return {"exito": False, "mensaje": f"No se encontraron 2 archivos FEV en {carpeta.name}. Se requiere el FEV antiguo y el FEV nuevo en la misma carpeta antes de ejecutar."}
+            return {
+                "exito": False, 
+                "mensaje": f"Se requieren al menos 2 archivos FEV. Encontrados: {[f.name for f in archivos_fev]}"
+            }
         
-        numero_carpeta = carpeta.name
+        num_carpeta = carpeta.name
         fev_antiguo = None
         fev_nuevo = None
         
-        # Intentar determinar cuál es el nuevo basado en el que NO coincide con el nombre de la carpeta
-        for fev in archivos_fev:
-            # Extraer número FEV (Formato FEV_NIT_NUMERO.pdf o similar)
-            match = re.search(r'FEV_.*_(\d+)\.pdf', fev.name, re.IGNORECASE)
-            if not match:
-                # Intento secundario: último bloque separado por guion bajo
-                num_fact_fev = fev.stem.split('_')[-1]
-            else:
-                num_fact_fev = match.group(1)
-            
-            if num_fact_fev == numero_carpeta: 
-                fev_antiguo = fev
-            else:
-                fev_nuevo = fev
-                
-        # Fallback: Determinar por fecha de modificación
-        if not fev_antiguo or not fev_nuevo:
+        # Intentar identificar por nombre (el que coincide con la carpeta es el viejo)
+        for f in archivos_fev:
+            match = re.search(r'FEV_.*_(\d+)\.pdf', f.name, re.IGNORECASE)
+            num = match.group(1) if match else f.stem.split('_')[-1]
+            if num == num_carpeta:
+                fev_antiguo = f
+                break
+        
+        # Si no se encontró por nombre, el más antiguo por fecha es el viejo
+        if fev_antiguo is None:
             archivos_fev.sort(key=lambda x: x.stat().st_mtime)
-            fev_antiguo = archivos_fev[0] # Modificado más antiguo
-            fev_nuevo = archivos_fev[-1]  # Modificado más recientemente
+            fev_antiguo = archivos_fev[0]
+            
+        # El FEV nuevo es el más reciente de los archivos restantes
+        otros = [f for f in archivos_fev if str(f) != str(fev_antiguo)]
+        if not otros:
+            return {"exito": False, "mensaje": "Error: Solo se detectó un archivo FEV único."}
+            
+        otros.sort(key=lambda x: x.stat().st_mtime)
+        fev_nuevo = otros[-1]
 
-        if fev_antiguo == fev_nuevo:
-             return {"exito": False, "mensaje": "No hay un archivo FEV diferente para realizar la actualización."}
+        # Validación final de seguridad antes de proceder
+        if fev_antiguo is None or fev_nuevo is None:
+             return {"exito": False, "mensaje": "No se pudieron identificar los archivos FEV (antiguo/nuevo)."}
 
-        # Extraer números limpios para reemplazar en los demás PDFs
-        def extraer_numero(archivo):
+        # Extraer IDs completos (NIT + Factura) para un renombrado más robusto
+        # Formato esperado: FEV_<NIT>_<FACTURA>.pdf -> Capturamos <NIT>_<FACTURA>
+        def extraer_id_completo(archivo):
+            match = re.search(r'FEV_(.*)\.pdf', archivo.name, re.IGNORECASE)
+            return match.group(1) if match else archivo.stem.split('FEV_')[-1]
+
+        def extraer_solo_factura(archivo):
             match = re.search(r'FEV_.*_(\d+)\.pdf', archivo.name, re.IGNORECASE)
             return match.group(1) if match else archivo.stem.split('_')[-1]
 
-        num_nuevo = extraer_numero(fev_nuevo)
-        num_antiguo = extraer_numero(fev_antiguo)
+        id_nuevo = extraer_id_completo(fev_nuevo)
+        id_antiguo = extraer_id_completo(fev_antiguo)
+        fact_nueva = extraer_solo_factura(fev_nuevo)
+        fact_antigua = extraer_solo_factura(fev_antiguo)
         
-        if not num_antiguo:
-             num_antiguo = numero_carpeta
-
-        if not fev_antiguo or not fev_nuevo:
-             return {"exito": False, "mensaje": "No se pudieron identificar los archivos FEV necesarios (antiguo y nuevo)."}
+        # Patrones a reemplazar en los otros PDFs (HEV, OPF, etc.)
+        # Priorizamos el ID completo (NIT_Factura)
+        patrones_reemplazo = [
+            (id_antiguo, id_nuevo),           # NIT_Factura antigua -> NIT_Factura nueva
+            (num_carpeta, fact_nueva),        # Carpeta (ej. 12345) -> Factura nueva
+            (fact_antigua, fact_nueva)        # Factura antigua sola -> Factura nueva
+        ]
 
         acciones = []
         try:
-            # Eliminar el FEV antiguo
-            fev_antiguo.unlink()
-            acciones.append(f"Eliminado: {fev_antiguo.name}")
+            # Eliminar el FEV antiguo de forma segura
+            nombre_viejo = fev_antiguo.name if fev_antiguo else "FEV_antiguo"
+            if fev_antiguo:
+                fev_antiguo.unlink()
+            acciones.append(f"Eliminado: {nombre_viejo}")
             
-            # Renombrar los demás archivos (HEV, OPF, PDE, etc.)
+            # Renombrar TODOS los archivos PDFs en la carpeta
             for archivo in carpeta.iterdir():
-                if archivo.is_file() and archivo.suffix.lower() == '.pdf' and archivo != fev_nuevo:
-                    nuevo_nombre = archivo.name.replace(num_antiguo, num_nuevo)
-                    if nuevo_nombre != archivo.name:
-                        nuevo_path = archivo.with_name(nuevo_nombre)
-                        archivo.rename(nuevo_path)
-                        acciones.append(f"Renombrado: {archivo.name} -> {nuevo_nombre}")
+                if archivo.is_file() and archivo.suffix.lower() == '.pdf' and str(archivo) != str(fev_nuevo):
+                    nombre_final = archivo.name
+                    # Aplicamos reemplazos en cadena para asegurar que todo cambie
+                    for viejo, nuevo in patrones_reemplazo:
+                        if viejo:
+                            nombre_final = nombre_final.replace(viejo, nuevo)
+                    
+                    if nombre_final != archivo.name:
+                        nuevo_path = archivo.with_name(nombre_final)
+                        # Evitar colisiones si el archivo ya existe
+                        if not nuevo_path.exists():
+                            archivo.rename(nuevo_path)
+                            acciones.append(f"Renombrado: {archivo.name} -> {nombre_final}")
             
-            # Renombrar la carpeta principal
-            nuevo_nombre_carpeta = carpeta.name.replace(num_antiguo, num_nuevo)
-            if num_antiguo not in carpeta.name: # Si el num antiguo no era parte exacta del nombre, sobreescribir
-                nuevo_nombre_carpeta = num_nuevo
-                
-            nueva_carpeta = carpeta.with_name(nuevo_nombre_carpeta)
+            # Renombrar la carpeta madre
+            # Priorizamos renombrarla con el número de factura nueva
+            nueva_carpeta = carpeta.with_name(fact_nueva)
             
             if nueva_carpeta != carpeta:
                 if nueva_carpeta.exists():
-                     return {"exito": True, "advertencia": f"Se modificaron los archivos, pero NO se pudo renombrar la carpeta madre porque ya existe una llamada '{nueva_carpeta.name}'.", "acciones": acciones, "nueva_ruta": str(carpeta)}
-                     
+                     return {"exito": True, "advertencia": f"Archivos actualizados. No se pudo renombrar la carpeta madre porque '{fact_nueva}' ya existe.", "acciones": acciones, "nueva_ruta": str(carpeta)}
+                
                 carpeta.rename(nueva_carpeta)
-                acciones.append(f"Carpeta renombrada a: {nuevo_nombre_carpeta}")
-                return {"exito": True, "mensaje": "Archivos y carpeta actualizados correctamente.", "acciones": acciones, "nueva_ruta": str(nueva_carpeta)}
+                acciones.append(f"Carpeta renombrada a factura: {fact_nueva}")
+                return {"exito": True, "mensaje": "¡Proceso finalizado con éxito!", "acciones": acciones, "nueva_ruta": str(nueva_carpeta)}
             
             return {"exito": True, "mensaje": "Archivos actualizados.", "acciones": acciones, "nueva_ruta": str(carpeta)}
+            
             
         except Exception as e:
             return {"exito": False, "mensaje": f"Error del sistema: {str(e)}"}
